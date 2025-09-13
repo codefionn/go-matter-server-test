@@ -1,0 +1,37 @@
+---
+# Go Matter Server Configuration Example
+
+# Server configuration
+server:
+  port: 5580
+  listen_addresses: []  # Empty means bind to all interfaces
+  serve_static: false   # Serve static files from ./dashboard/
+
+# Storage configuration
+storage:
+  path: ""  # Empty means use default: $HOME/.matter_server
+
+# Matter protocol configuration  
+matter:
+  vendor_id: 0xFFF1        # Default vendor ID
+  fabric_id: 1             # Default fabric ID  
+  paa_root_cert_dir: ""    # Directory for PAA root certificates
+  enable_test_net_dcl: false
+  disable_server_interactions: false
+
+# Network configuration
+network:
+  primary_interface: ""    # Primary network interface for link-local addresses
+
+# Bluetooth configuration
+bluetooth:
+  adapter_id: -1           # Bluetooth adapter ID (-1 to disable). When >= 0, bluetooth is enabled.
+
+# OTA (Over-The-Air) update configuration
+ota:
+  provider_dir: ""         # Directory for OTA Provider software updates
+
+# Logging configuration
+log:
+  level: "info"            # trace, debug, info, warn, error, fatal
+  format: "console"        # console, json

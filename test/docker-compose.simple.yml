@@ -1,0 +1,27 @@
+# Simplified Docker Compose for basic testing
+services:
+  matter-server:
+    build:
+      context: ..
+      dockerfile: test/Dockerfile
+    container_name: matter-server
+    ports:
+      - "5580:5580"
+    volumes:
+      - ./data:/app/data
+      - ./config/test-config.yaml:/app/config.yaml:ro
+    environment:
+      - MATTER_LOG_LEVEL=debug
+      - MATTER_SERVER_PORT=5580
+    command: ["./matter-server", "--config", "/app/config.yaml"]
+
+  example-client:
+    build:
+      context: ..
+      dockerfile: test/Dockerfile
+    container_name: example-client
+    depends_on:
+      - matter-server
+    command: ["sh", "-c", "sleep 5 && ./example-client"]
+    profiles:
+      - client

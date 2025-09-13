@@ -1,0 +1,66 @@
+# Go build artifacts
+/go-matter-server
+/matter-server
+/example-client
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go test coverage
+*.out
+coverage.html
+
+# Go module cache
+go.sum.backup
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+[Tt]humbs.db
+
+# Nix build results
+/result
+/result-*
+
+# Direnv
+/.direnv/
+
+# Matter server storage (runtime data)
+/.matter_server/
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+
+# Environment files (but keep .envrc and .env.example)
+.env
+.env.local
+.env.*.local
+!.env.example
+!/test/.env
+
+# Claude artifacts
+/.claude
+
+/test/config
+/test/data
+/test/logs
+
+# Python matter server (reference implementation)
+#/python-matter-server/

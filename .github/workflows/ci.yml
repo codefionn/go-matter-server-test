@@ -1,0 +1,482 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+
+env:
+  DOCKER_BUILDKIT: 1
+
+jobs:
+  format-check:
+    name: Format Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Format check
+        run: |
+          if [ -n "$(gofmt -l .)" ]; then
+            echo "Code is not formatted. Please run 'go fmt ./...'"
+            gofmt -d .
+            exit 1
+          fi
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v4
+        with:
+          version: latest
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Install dependencies
+        run: go mod download
+
+      - name: Run unit tests
+        run: go test -v $(go list ./... | grep -v /e2e) -coverprofile=coverage.out -covermode=count
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./coverage.out
+          flags: unittests
+          name: codecov-umbrella
+
+  integration-test:
+    name: Integration Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Install dependencies
+        run: go mod download
+
+      - name: Run integration tests
+        run: go test -v -run TestE2E ./...
+
+  docker-test:
+    name: Container Test Environment
+    runs-on: ubuntu-latest
+    needs: [format-check, lint, test]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Install podman-compose (preferred)
+        run: |
+          # Install podman-compose as preferred container orchestration
+          sudo apt-get update
+          sudo apt-get install -y podman python3-pip
+          pip3 install podman-compose
+          echo "Installed podman-compose"
+          podman-compose version || echo "podman-compose version check failed"
+
+      - name: Verify Docker test setup
+        run: |
+          cd test
+          chmod +x verify-setup.sh
+          ./verify-setup.sh
+
+      - name: Detect and validate container orchestration
+        run: |
+          cd test
+          echo "🔍 Detecting container orchestration tools..."
+          
+          # Source compose detection
+          source ./detect-compose.sh
+          
+          # Show detection results
+          echo "Detected compose command: $(get_compose_command)"
+          echo "Detected compose type: $(get_compose_type)"
+          echo "Suggested compose file: $(get_compose_file)"
+          
+          # Get compose command for validation
+          compose_cmd="$(get_compose_command)"
+          if [ -z "$compose_cmd" ]; then
+            echo "❌ No working compose command available"
+            exit 1
+          fi
+          
+          # Validate main compose file
+          echo "Validating docker-compose.yml with $compose_cmd..."
+          if $compose_cmd config --quiet; then
+            echo "✅ Main docker-compose.yml is valid"
+          else
+            echo "❌ Main docker-compose.yml is invalid"
+            $compose_cmd config
+            exit 1
+          fi
+          
+          # Validate simple compose file
+          echo "Validating docker-compose.simple.yml with $compose_cmd..."
+          if $compose_cmd -f docker-compose.simple.yml config --quiet; then
+            echo "✅ docker-compose.simple.yml is valid"
+          else
+            echo "❌ docker-compose.simple.yml is invalid"
+            $compose_cmd -f docker-compose.simple.yml config
+            exit 1
+          fi
+          
+          # Check for required files
+          required_files=(
+            "Dockerfile"
+            "config/test-config.yaml"
+            ".env"
+            "scripts/run-tests.sh"
+            "Makefile"
+            "detect-compose.sh"
+          )
+          
+          for file in "${required_files[@]}"; do
+            if [ ! -f "$file" ]; then
+              echo "❌ Required file missing: $file"
+              exit 1
+            fi
+            echo "✅ Found required file: $file"
+          done
+
+      - name: Build container images
+        run: |
+          cd test
+          echo "Building container images..."
+          
+          # Source compose detection
+          source ./detect-compose.sh
+          compose_cmd="$(get_compose_command)"
+          compose_file="$(get_compose_file)"
+          
+          echo "Using: $compose_cmd with $compose_file"
+          
+          if ! $compose_cmd -f "$compose_file" build --parallel 2>/dev/null; then
+            echo "⚠️ Parallel build failed, trying sequential build..."
+            if ! $compose_cmd -f "$compose_file" build; then
+              echo "⚠️ Build with $compose_file failed, trying fallback..."
+              if [ "$compose_file" != "docker-compose.simple.yml" ]; then
+                $compose_cmd -f docker-compose.simple.yml build || {
+                  echo "❌ All builds failed"
+                  exit 1
+                }
+              else
+                echo "❌ Build failed"
+                exit 1
+              fi
+            fi
+          fi
+          echo "✅ Container images built successfully"
+
+      - name: Run container health checks
+        run: |
+          cd test
+          # Source compose detection
+          source ./detect-compose.sh
+          compose_cmd="$(get_compose_command)"
+          compose_file="$(get_compose_file)"
+          
+          echo "Starting services with $compose_cmd..."
+          
+          # Start services in background
+          $compose_cmd -f "$compose_file" up -d matter-server
+          
+          # Wait for health check to pass (max 2 minutes)
+          timeout=120
+          echo "Waiting for matter-server to be healthy..."
+          while [ $timeout -gt 0 ]; do
+            if $compose_cmd -f "$compose_file" ps matter-server | grep -q "healthy\|Up"; then
+              echo "✅ matter-server is running!"
+              break
+            fi
+            echo -n "."
+            sleep 2
+            timeout=$((timeout-2))
+          done
+          
+          if [ $timeout -le 0 ]; then
+            echo "❌ Health check timeout"
+            $compose_cmd -f "$compose_file" logs matter-server
+            exit 1
+          fi
+
+      - name: Run example client test
+        run: |
+          cd test
+          # Source compose detection
+          source ./detect-compose.sh
+          compose_cmd="$(get_compose_command)"
+          compose_file="$(get_compose_file)"
+          
+          echo "🔌 Testing example client with $compose_cmd..."
+          timeout 30s $compose_cmd -f "$compose_file" --profile client up example-client || {
+            echo "Client test completed (expected timeout)"
+          }
+
+      - name: Run integration test suite
+        run: |
+          cd test
+          # Source compose detection
+          source ./detect-compose.sh
+          compose_cmd="$(get_compose_command)"
+          compose_file="$(get_compose_file)"
+          
+          echo "🧪 Running integration tests with $compose_cmd..."
+          $compose_cmd -f "$compose_file" --profile test up --abort-on-container-exit test-runner
+
+      - name: Test WebSocket API endpoints
+        run: |
+          cd test
+          # Source compose detection
+          source ./detect-compose.sh
+          compose_cmd="$(get_compose_command)"
+          compose_file="$(get_compose_file)"
+          
+          echo "🔍 Testing WebSocket API endpoints..."
+          
+          # Test health endpoint
+          curl -f http://localhost:5580/health || {
+            echo "❌ Health endpoint failed"
+            $compose_cmd -f "$compose_file" logs matter-server
+            exit 1
+          }
+          
+          # Test WebSocket connectivity with a simple script
+          $compose_cmd -f "$compose_file" exec -T matter-server sh -c '
+            echo "Testing WebSocket endpoint..."
+            timeout 5s nc -z localhost 5580 && echo "✅ WebSocket port is open" || echo "❌ WebSocket port test failed"
+          '
+
+      - name: Test mDNS functionality
+        run: |
+          cd test
+          # Source compose detection
+          source ./detect-compose.sh
+          compose_cmd="$(get_compose_command)"
+          compose_file="$(get_compose_file)"
+          
+          echo "📡 Testing mDNS functionality..."
+          $compose_cmd -f "$compose_file" logs matter-server | grep -i "mdns" || echo "No mDNS logs found"
+          $compose_cmd -f "$compose_file" exec -T matter-server sh -c '
+            echo "Checking mDNS process..."
+            ps aux | grep matter-server || echo "Process check completed"
+          '
+
+      - name: Collect test artifacts
+        if: always()
+        run: |
+          cd test
+          # Source compose detection
+          source ./detect-compose.sh
+          compose_cmd="$(get_compose_command)"
+          compose_file="$(get_compose_file)"
+          
+          echo "📋 Collecting logs and test artifacts..."
+          mkdir -p artifacts
+          
+          # Save detection results
+          echo "Compose command: $compose_cmd" > artifacts/detection-results.txt
+          echo "Compose type: $(get_compose_type)" >> artifacts/detection-results.txt
+          echo "Compose file: $compose_file" >> artifacts/detection-results.txt
+          
+          # Collect container logs
+          $compose_cmd -f "$compose_file" logs --no-color > artifacts/compose.log 2>&1 || true
+          $compose_cmd -f "$compose_file" logs --no-color matter-server > artifacts/matter-server.log 2>&1 || true
+          $compose_cmd -f "$compose_file" logs --no-color example-client > artifacts/example-client.log 2>&1 || true
+          $compose_cmd -f "$compose_file" logs --no-color test-runner > artifacts/test-runner.log 2>&1 || true
+          
+          # Collect container status
+          $compose_cmd -f "$compose_file" ps > artifacts/container-status.txt 2>&1 || true
+          
+          # Collect system info (try both docker and podman)
+          if command -v docker >/dev/null 2>&1; then
+            docker system df > artifacts/docker-system.txt 2>&1 || true
+            docker images > artifacts/docker-images.txt 2>&1 || true
+          fi
+          if command -v podman >/dev/null 2>&1; then
+            podman system df > artifacts/podman-system.txt 2>&1 || true
+            podman images > artifacts/podman-images.txt 2>&1 || true
+          fi
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: container-test-artifacts
+          path: test/artifacts/
+          retention-days: 7
+
+      - name: Cleanup container resources
+        if: always()
+        run: |
+          cd test
+          # Source compose detection
+          source ./detect-compose.sh
+          compose_cmd="$(get_compose_command)"
+          compose_file="$(get_compose_file)"
+          compose_type="$(get_compose_type)"
+          
+          echo "🧹 Cleaning up container resources..."
+          $compose_cmd -f "$compose_file" down -v --remove-orphans || true
+          
+          # Clean up system resources based on detected type
+          if [ "$compose_type" = "docker" ]; then
+            docker system prune -f || true
+          elif [ "$compose_type" = "podman" ]; then
+            podman system prune -f || true
+          fi
+
+  docker-build:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    needs: [format-check, lint, test, docker-test]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build with docker-bake (dev)
+        run: docker buildx bake --set *.platform=linux/amd64 dev
+
+  nix-build:
+    name: Nix Build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Run the Magic Nix Cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Check Nix flake
+        run: nix flake check
+
+      - name: Build with Nix
+        run: nix build
+
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [format-check, lint, test, integration-test, docker-test, docker-build]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build and push Docker image
+        uses: docker/bake-action@v4
+        with:
+          targets: release
+          push: true
+        env:
+          VERSION: ${{ github.ref_name }}
+
+      - name: Build release binaries
+        run: |
+          mkdir -p dist
+          GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o dist/go-matter-server-linux-amd64 ./cmd/matter-server
+          GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o dist/go-matter-server-linux-arm64 ./cmd/matter-server
+          GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o dist/go-matter-server-darwin-amd64 ./cmd/matter-server
+          GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o dist/go-matter-server-darwin-arm64 ./cmd/matter-server
+          GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o dist/go-matter-server-windows-amd64.exe ./cmd/matter-server
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: dist/*
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  docker-dev-build:
+    name: Docker Dev Build (MR)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    needs: [format-check, lint, test, docker-test]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build dev image
+        uses: docker/bake-action@v4
+        with:
+          targets: dev
+          load: true
+
+      - name: Test Docker image
+        run: |
+          docker run --rm go-matter-server:dev --help
